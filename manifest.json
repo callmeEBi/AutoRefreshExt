@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Auto Tab Refresher",
+  "version": "1.0.0",
+  "description": "Automatically refreshes the current tab at a customizable interval.",
+
+  "permissions": ["tabs", "storage", "alarms", "activeTab"],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_title": "Auto Refresh: OFF"
+  },
+
+  "options_page": "options.html"
+}

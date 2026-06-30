@@ -1,203 +1,372 @@
-// ─────────────────────────────────────────────────────────────
-// CONSTANTS
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  AUTO REFRESH — BACKGROUND SERVICE WORKER  (Manifest V3)
+//
+//  Architecture:
+//    1. User clicks icon  →  toggle ON/OFF for that tabId
+//    2. ON:  save {tabId, interval} to session storage
+//            inject reloadScript into the tab (setTimeout → reload)
+//            start a countdown ticker in THIS worker (setInterval)
+//    3. Tab finishes reloading  →  tabs.onUpdated fires
+//            if tabId is active in session  →  re-inject + restart ticker
+//    4. OFF: remove from session, clear ticker, clear badge
+// ═══════════════════════════════════════════════════════════════
 
-// Alarm names are prefixed with the tab ID so each tab
-// gets its own independent alarm.
-const ALARM_PREFIX = "autorefresh_tab_";
+const DEFAULT_INTERVAL = 5; // seconds — fallback if storage is empty
 
-// Default interval in seconds if the user hasn't set one yet.
-const DEFAULT_INTERVAL_SECONDS = 1;
+// In-memory map of active countdown tickers.
+// Key: tabId (number)  Value: setInterval ID (number)
+// This lives only in the service worker's memory; it is rebuilt
+// from session storage whenever the worker wakes up.
+const countdownTickers = new Map();
 
-// ─────────────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────
+// STORAGE HELPERS
+// chrome.storage.session  →  which tabs are active + their interval
+// chrome.storage.sync     →  user's preferred interval from options page
+// ───────────────────────────────────────────────────────────────
 
 /**
- * Returns the alarm name for a given tab ID.
- * @param {number} tabId
- * @returns {string}
+ * Returns the full map of active tabs from session storage.
+ * Shape: { [tabId: string]: { interval: number, startedAt: number } }
+ * @returns {Promise<Object>}
  */
-function alarmName(tabId) {
-  return `${ALARM_PREFIX}${tabId}`;
+async function getActiveTabs() {
+  const result = await chrome.storage.session.get("activeTabs");
+  return result.activeTabs ?? {};
 }
 
 /**
- * Reads the user-configured interval from chrome.storage.sync.
- * Falls back to DEFAULT_INTERVAL_SECONDS if not set.
- * @returns {Promise<number>} interval in seconds
+ * Persists the full active-tabs map back to session storage.
+ * @param {Object} map
  */
-async function getIntervalSeconds() {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(
-      { intervalSeconds: DEFAULT_INTERVAL_SECONDS },
-      (data) => {
-        const val = parseFloat(data.intervalSeconds);
-        // Guard against nonsensical values (alarms require >= 1 minute
-        // for periodInMinutes, but we'll use delayInMinutes trick below).
-        resolve(isNaN(val) || val <= 0 ? DEFAULT_INTERVAL_SECONDS : val);
-      },
-    );
-  });
+async function setActiveTabs(map) {
+  await chrome.storage.session.set({ activeTabs: map });
 }
 
 /**
- * Checks whether a specific tab currently has an active alarm.
+ * Checks if a specific tab is currently active.
  * @param {number} tabId
  * @returns {Promise<boolean>}
  */
-async function isTabRefreshing(tabId) {
-  const alarm = await chrome.alarms.get(alarmName(tabId));
-  return alarm !== undefined;
+async function isTabActive(tabId) {
+  const map = await getActiveTabs();
+  return Object.prototype.hasOwnProperty.call(map, String(tabId));
 }
 
 /**
- * Updates the browser action badge to reflect ON/OFF state.
- * @param {number} tabId
- * @param {boolean} isOn
+ * Reads the user-configured interval from sync storage.
+ * @returns {Promise<number>} seconds
  */
-function updateBadge(tabId, isOn) {
-  if (isOn) {
-    chrome.action.setBadgeText({ text: "ON", tabId });
-    chrome.action.setBadgeBackgroundColor({ color: "#16a34a", tabId }); // green-700
-    chrome.action.setTitle({
-      title: "Auto Refresh: ON — Click to stop",
-      tabId,
-    });
-  } else {
-    chrome.action.setBadgeText({ text: "OFF", tabId });
-    chrome.action.setBadgeBackgroundColor({ color: "#dc2626", tabId }); // red-600
-    chrome.action.setTitle({
-      title: "Auto Refresh: OFF — Click to start",
-      tabId,
-    });
+async function getUserInterval() {
+  const result = await chrome.storage.sync.get({
+    intervalSeconds: DEFAULT_INTERVAL,
+  });
+  const val = parseFloat(result.intervalSeconds);
+  return isNaN(val) || val < 0.5 ? DEFAULT_INTERVAL : val;
+}
+
+// ───────────────────────────────────────────────────────────────
+// BADGE HELPERS
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * Sets the badge to show a countdown number (green background).
+ * @param {number} tabId
+ * @param {number} seconds  — the number to display
+ */
+function setBadgeCountdown(tabId, seconds) {
+  const label = seconds > 99 ? "99+" : String(Math.ceil(seconds));
+  chrome.action.setBadgeText({ text: label, tabId });
+  chrome.action.setBadgeBackgroundColor({ color: "#16a34a", tabId });
+}
+
+/**
+ * Clears the badge (OFF state).
+ * @param {number} tabId
+ */
+function clearBadge(tabId) {
+  chrome.action.setBadgeText({ text: "", tabId });
+  chrome.action.setTitle({
+    title: "Auto Refresh: OFF — Click to start",
+    tabId,
+  });
+}
+
+/**
+ * Sets the badge to a static "ON" flash shown right after a reload,
+ * before the countdown restarts.
+ * @param {number} tabId
+ */
+function setBadgeOn(tabId) {
+  chrome.action.setBadgeText({ text: "ON", tabId });
+  chrome.action.setBadgeBackgroundColor({ color: "#16a34a", tabId });
+  chrome.action.setTitle({ title: "Auto Refresh: ON — Click to stop", tabId });
+}
+
+// ───────────────────────────────────────────────────────────────
+// COUNTDOWN TICKER
+// Runs entirely inside the service worker using setInterval.
+// Counts down from `interval` to 1, updating the badge each second.
+// The tab reload itself is handled by the injected script — this
+// ticker is purely visual.
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * Stops and removes the countdown ticker for a tab.
+ * @param {number} tabId
+ */
+function stopTicker(tabId) {
+  if (countdownTickers.has(tabId)) {
+    clearInterval(countdownTickers.get(tabId));
+    countdownTickers.delete(tabId);
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// CORE: START / STOP REFRESH
-// ─────────────────────────────────────────────────────────────
-
 /**
- * Starts auto-refresh for a tab by creating a repeating alarm.
- *
- * chrome.alarms minimum period is 1 minute for periodInMinutes.
- * For sub-minute intervals, we chain single-shot alarms:
- *   each alarm fires → reloads tab → schedules the next alarm.
+ * Starts a new countdown ticker for a tab.
+ * Counts down from `intervalSeconds` to 1, then stops
+ * (the reload event will restart it via tabs.onUpdated).
  *
  * @param {number} tabId
+ * @param {number} intervalSeconds
  */
-async function startRefresh(tabId) {
-  const seconds = await getIntervalSeconds();
+function startTicker(tabId, intervalSeconds) {
+  // Always clear any existing ticker first to avoid duplicates.
+  stopTicker(tabId);
 
-  // Store the interval alongside the tab so the alarm handler
-  // knows how long to wait before scheduling the next shot.
-  await chrome.storage.session.set({ [`tab_interval_${tabId}`]: seconds });
+  // Remaining time starts at the full interval.
+  let remaining = intervalSeconds;
+  setBadgeCountdown(tabId, remaining);
 
-  // Create the first single-shot alarm (delayInMinutes accepts decimals).
-  chrome.alarms.create(alarmName(tabId), {
-    delayInMinutes: seconds / 60,
-  });
+  const tickerId = setInterval(() => {
+    remaining -= 1;
 
-  updateBadge(tabId, true);
-  console.log(`[AutoRefresh] Started for tab ${tabId} every ${seconds}s`);
+    if (remaining <= 0) {
+      // The injected script is about to fire window.location.reload().
+      // Show "ON" as a visual bridge until the page reloads and
+      // tabs.onUpdated restarts the ticker.
+      setBadgeOn(tabId);
+      stopTicker(tabId);
+      return;
+    }
+
+    setBadgeCountdown(tabId, remaining);
+  }, 1000); // tick every real second
+
+  countdownTickers.set(tabId, tickerId);
+}
+
+// ───────────────────────────────────────────────────────────────
+// SCRIPT INJECTION
+// Injects a tiny self-contained script into the tab.
+// The script uses setTimeout to call window.location.reload()
+// after the specified interval. It stores its timeout ID on
+// window so it can be cancelled by a follow-up injection.
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * Injects the reload script into a tab.
+ * @param {number} tabId
+ * @param {number} intervalSeconds
+ */
+async function injectReloadScript(tabId, intervalSeconds) {
+  const ms = Math.round(intervalSeconds * 1000);
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      // `func` is serialised and run in the page's context.
+      // It must be self-contained — no closure variables from
+      // background.js are available inside it.
+      func: (delayMs) => {
+        // Cancel any previously injected timeout to prevent
+        // double-reloads if the script is injected more than once.
+        if (window.__autoRefreshTimeoutId !== undefined) {
+          clearTimeout(window.__autoRefreshTimeoutId);
+        }
+
+        window.__autoRefreshTimeoutId = setTimeout(() => {
+          window.location.reload();
+        }, delayMs);
+      },
+      args: [ms],
+    });
+  } catch (err) {
+    // Injection can fail on chrome:// pages, the new-tab page, etc.
+    // In that case, silently stop refreshing this tab.
+    console.warn(`[AutoRefresh] Cannot inject into tab ${tabId}:`, err.message);
+    await deactivateTab(tabId);
+  }
 }
 
 /**
- * Stops auto-refresh for a tab by clearing its alarm.
+ * Injects a cancellation script to clear the pending setTimeout.
+ * Called when the user toggles OFF.
  * @param {number} tabId
  */
-async function stopRefresh(tabId) {
-  await chrome.alarms.clear(alarmName(tabId));
-  await chrome.storage.session.remove(`tab_interval_${tabId}`);
-  updateBadge(tabId, false);
-  console.log(`[AutoRefresh] Stopped for tab ${tabId}`);
+async function injectCancelScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        if (window.__autoRefreshTimeoutId !== undefined) {
+          clearTimeout(window.__autoRefreshTimeoutId);
+          window.__autoRefreshTimeoutId = undefined;
+        }
+      },
+    });
+  } catch {
+    // Tab may already be gone or on a restricted page — that's fine.
+  }
 }
 
-// ─────────────────────────────────────────────────────────────
-// EVENT: TOOLBAR ICON CLICKED
-// ─────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────
+// ACTIVATE / DEACTIVATE
+// ───────────────────────────────────────────────────────────────
+
+/**
+ * Activates auto-refresh for a tab.
+ * @param {number} tabId
+ */
+async function activateTab(tabId) {
+  const interval = await getUserInterval();
+
+  // Persist to session storage so we survive service worker restarts.
+  const map = await getActiveTabs();
+  map[String(tabId)] = { interval, startedAt: Date.now() };
+  await setActiveTabs(map);
+
+  // Inject the reload script into the live tab.
+  await injectReloadScript(tabId, interval);
+
+  // Start the visual countdown in the service worker.
+  startTicker(tabId, interval);
+
+  console.log(`[AutoRefresh] Activated tab ${tabId} — interval: ${interval}s`);
+}
+
+/**
+ * Deactivates auto-refresh for a tab.
+ * @param {number} tabId
+ */
+async function deactivateTab(tabId) {
+  // Remove from session storage.
+  const map = await getActiveTabs();
+  delete map[String(tabId)];
+  await setActiveTabs(map);
+
+  // Stop the countdown ticker.
+  stopTicker(tabId);
+
+  // Cancel the pending setTimeout inside the tab (best-effort).
+  await injectCancelScript(tabId);
+
+  // Clear the badge.
+  clearBadge(tabId);
+
+  console.log(`[AutoRefresh] Deactivated tab ${tabId}`);
+}
+
+// ───────────────────────────────────────────────────────────────
+// EVENT: TOOLBAR ICON CLICKED  →  toggle ON / OFF
+// ───────────────────────────────────────────────────────────────
 
 chrome.action.onClicked.addListener(async (tab) => {
-  // tab.id can be undefined for some special pages (e.g. chrome://newtab).
   if (!tab.id) return;
 
-  const refreshing = await isTabRefreshing(tab.id);
+  const active = await isTabActive(tab.id);
 
-  if (refreshing) {
-    await stopRefresh(tab.id);
+  if (active) {
+    await deactivateTab(tab.id);
   } else {
-    await startRefresh(tab.id);
+    await activateTab(tab.id);
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// EVENT: ALARM FIRED → RELOAD TAB + RESCHEDULE
-// ─────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────
+// EVENT: TAB UPDATED  →  re-inject after each reload completes
+//
+// This is the core of the loop:
+//   page reloads  →  status becomes 'complete'  →  we re-inject
+//   the setTimeout script  →  page reloads again  →  repeat
+// ───────────────────────────────────────────────────────────────
 
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-  // Only handle our own alarms.
-  if (!alarm.name.startsWith(ALARM_PREFIX)) return;
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  // We only care about tabs that have finished loading.
+  if (changeInfo.status !== "complete") return;
 
-  // Extract the tab ID from the alarm name.
-  const tabId = parseInt(alarm.name.replace(ALARM_PREFIX, ""), 10);
-  if (isNaN(tabId)) return;
+  const map = await getActiveTabs();
+  const entry = map[String(tabId)];
 
-  // Verify the tab still exists before reloading.
-  let tab;
-  try {
-    tab = await chrome.tabs.get(tabId);
-  } catch {
-    // Tab was closed — clean up silently.
-    await chrome.storage.session.remove(`tab_interval_${tabId}`);
-    console.log(`[AutoRefresh] Tab ${tabId} no longer exists. Stopping.`);
-    return;
-  }
+  // Not one of our active tabs — ignore.
+  if (!entry) return;
 
-  // Don't reload if the tab is currently loading (avoid reload storms).
-  if (tab.status !== "loading") {
-    chrome.tabs.reload(tabId);
-    console.log(`[AutoRefresh] Reloaded tab ${tabId}`);
-  }
+  const { interval } = entry;
 
-  // Reschedule the next single-shot alarm using the stored interval.
-  const result = await chrome.storage.session.get(`tab_interval_${tabId}`);
-  const seconds = result[`tab_interval_${tabId}`] ?? DEFAULT_INTERVAL_SECONDS;
+  // Re-inject the reload script now that the page is fresh.
+  await injectReloadScript(tabId, interval);
 
-  chrome.alarms.create(alarmName(tabId), {
-    delayInMinutes: seconds / 60,
-  });
+  // Restart the visual countdown.
+  startTicker(tabId, interval);
+
+  console.log(
+    `[AutoRefresh] Tab ${tabId} reloaded — re-injected, countdown restarted`,
+  );
 });
 
-// ─────────────────────────────────────────────────────────────
-// EVENT: TAB CLOSED → AUTO CLEANUP
-// ─────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────
+// EVENT: TAB CLOSED  →  clean up
+// ───────────────────────────────────────────────────────────────
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
-  // Clear any lingering alarm and session data when a tab closes.
-  await chrome.alarms.clear(alarmName(tabId));
-  await chrome.storage.session.remove(`tab_interval_${tabId}`);
-  console.log(`[AutoRefresh] Cleaned up closed tab ${tabId}`);
+  const active = await isTabActive(tabId);
+  if (!active) return;
+
+  // Just clean up storage and ticker — no need to inject cancel script.
+  const map = await getActiveTabs();
+  delete map[String(tabId)];
+  await setActiveTabs(map);
+
+  stopTicker(tabId);
+  console.log(`[AutoRefresh] Tab ${tabId} closed — cleaned up`);
 });
 
-// ─────────────────────────────────────────────────────────────
-// STARTUP: RESTORE BADGE STATE
-// ─────────────────────────────────────────────────────────────
-// When the service worker restarts, existing alarms survive but
-// the badge is visual-only and resets. Re-apply badges for any
-// tabs that still have active alarms.
+// ───────────────────────────────────────────────────────────────
+// SERVICE WORKER WAKE-UP  →  restore tickers from session storage
+//
+// When Chrome restarts the service worker (after it went dormant),
+// countdownTickers is empty. We rebuild it from session storage
+// so any previously-active tabs resume their countdown display.
+// The reload loop itself will continue via tabs.onUpdated as long
+// as the injected script is still running in the tab.
+// ───────────────────────────────────────────────────────────────
 
-chrome.runtime.onStartup.addListener(restoreBadges);
-chrome.runtime.onInstalled.addListener(restoreBadges);
+async function restoreActiveState() {
+  const map = await getActiveTabs();
 
-async function restoreBadges() {
-  const allAlarms = await chrome.alarms.getAll();
-  for (const alarm of allAlarms) {
-    if (alarm.name.startsWith(ALARM_PREFIX)) {
-      const tabId = parseInt(alarm.name.replace(ALARM_PREFIX, ""), 10);
-      if (!isNaN(tabId)) {
-        updateBadge(tabId, true);
-      }
+  for (const [tabIdStr, entry] of Object.entries(map)) {
+    const tabId = parseInt(tabIdStr, 10);
+    if (isNaN(tabId)) continue;
+
+    // Verify the tab still exists.
+    try {
+      await chrome.tabs.get(tabId);
+    } catch {
+      // Tab is gone — remove stale entry.
+      delete map[tabIdStr];
+      continue;
     }
+
+    // Restart the ticker so the badge shows a live countdown again.
+    startTicker(tabId, entry.interval);
+    setBadgeOn(tabId);
+    console.log(`[AutoRefresh] Restored ticker for tab ${tabId}`);
   }
+
+  // Persist cleaned-up map (stale tabs removed).
+  await setActiveTabs(map);
 }
+
+// Runs when the service worker first installs or Chrome starts.
+chrome.runtime.onInstalled.addListener(restoreActiveState);
+chrome.runtime.onStartup.addListener(restoreActiveState);

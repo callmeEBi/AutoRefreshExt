@@ -1,56 +1,71 @@
 // ─────────────────────────────────────────────────────────────
-// OPTIONS PAGE LOGIC
-// Loads the saved interval on page open, saves on button click.
+//  OPTIONS PAGE — options.js
+//  Loads saved interval on open, saves on button click.
+//  Preset buttons fill the input for quick selection.
 // ─────────────────────────────────────────────────────────────
 
 const intervalInput = document.getElementById("intervalInput");
 const saveBtn = document.getElementById("saveBtn");
 const statusEl = document.getElementById("status");
+const presetBtns = document.querySelectorAll(".preset-btn");
 
-let statusTimer = null; // Tracks the fade-out timer so we can reset it.
+let statusTimer = null;
 
 // ── Load saved value when the options page opens ──────────────
-chrome.storage.sync.get({ intervalSeconds: 1 }, (data) => {
+chrome.storage.sync.get({ intervalSeconds: 5 }, (data) => {
   intervalInput.value = data.intervalSeconds;
 });
 
-// ── Save on button click ──────────────────────────────────────
-saveBtn.addEventListener("click", () => {
-  const raw = parseFloat(intervalInput.value);
-
-  // Validate: must be a positive number.
-  if (isNaN(raw) || raw <= 0) {
-    showStatus("⚠ Please enter a valid positive number.", "#dc2626");
-    return;
-  }
-
-  // Round to 2 decimal places to avoid floating-point noise.
-  const intervalSeconds = Math.round(raw * 100) / 100;
-
-  chrome.storage.sync.set({ intervalSeconds }, () => {
-    showStatus("✓ Settings saved!", "#16a34a");
-    console.log(`[Options] Saved interval: ${intervalSeconds}s`);
+// ── Preset buttons fill the input field ──────────────────────
+presetBtns.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    intervalInput.value = btn.dataset.value;
+    // Immediately save when a preset is clicked for convenience.
+    saveSettings();
   });
 });
 
-// ── Also save when the user presses Enter in the input ────────
+// ── Save button ───────────────────────────────────────────────
+saveBtn.addEventListener("click", saveSettings);
+
+// ── Enter key in input ────────────────────────────────────────
 intervalInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") saveBtn.click();
+  if (e.key === "Enter") saveSettings();
 });
 
 /**
- * Shows a temporary status message below the save button.
+ * Validates the input and persists the interval to sync storage.
+ */
+function saveSettings() {
+  const raw = parseFloat(intervalInput.value);
+
+  if (isNaN(raw) || raw < 0.5) {
+    showStatus("⚠ Minimum interval is 0.5 seconds.", "#dc2626");
+    intervalInput.focus();
+    return;
+  }
+
+  // Round to 2 decimal places.
+  const intervalSeconds = Math.round(raw * 100) / 100;
+
+  chrome.storage.sync.set({ intervalSeconds }, () => {
+    showStatus("✓ Saved! Active tabs will use this on next toggle.", "#16a34a");
+    console.log(`[Options] Saved intervalSeconds = ${intervalSeconds}`);
+  });
+}
+
+/**
+ * Displays a temporary status message with auto-fade.
  * @param {string} message
- * @param {string} color  CSS color string
+ * @param {string} color
  */
 function showStatus(message, color) {
   statusEl.textContent = message;
   statusEl.style.color = color;
   statusEl.classList.add("visible");
 
-  // Clear any previous timer so rapid saves don't stack.
   if (statusTimer) clearTimeout(statusTimer);
   statusTimer = setTimeout(() => {
     statusEl.classList.remove("visible");
-  }, 2500);
+  }, 3000);
 }
